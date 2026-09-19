@@ -60,6 +60,13 @@ public final class LedgerEngine {
                     apply(ledger, event, day);
                 }
             }
+            for (LedgerEvent event : ordered) {
+                if (event.bookingDay() == day && event.valueDay() < day) {
+                    for (int affected = event.valueDay(); affected < day; affected++) {
+                        ledger.recordBackdatedView(event.accountId(), affected, day);
+                    }
+                }
+            }
             closeDay(ledger, day, firstDay);
         }
         capitalise(ledger, lastDay);

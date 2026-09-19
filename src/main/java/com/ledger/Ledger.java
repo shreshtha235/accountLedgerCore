@@ -24,6 +24,8 @@ public final class Ledger {
     private final Map<String, TreeMap<Integer, Money>> snapshots = new HashMap<>();
     // latest state per authRef — rebuilt on every record(), never scanned from scratch
     private final Map<String, AuthorizationTransition> latestTransitionCache = new LinkedHashMap<>();
+    // accountId → valueDay → (bookingDay → balance): intermediate states from backdated postings
+    private final Map<String, Map<Integer, Map<Integer, Money>>> backdatedViews = new HashMap<>();
     private long nextSeq;
 
     public Ledger(List<Account> accounts) {
@@ -126,6 +128,20 @@ public final class Ledger {
 
     public List<LedgerError> errors() {
         return Collections.unmodifiableList(errors);
+    }
+
+    public void recordBackdatedView(String accountId, int valueDay, int bookingDay) {
+        backdatedViews
+                .computeIfAbsent(accountId, k -> new HashMap<>())
+                .computeIfAbsent(valueDay, k -> new LinkedHashMap<>())
+                .put(bookingDay, balance(accountId, valueDay, bookingDay));
+    }
+
+    public Map<Integer, Money> backdatedViewsFor(String accountId, int valueDay) {
+        Map<Integer, Map<Integer, Money>> byValueDay = backdatedViews.get(accountId);
+        if (byValueDay == null) return Map.of();
+        Map<Integer, Money> result = byValueDay.get(valueDay);
+        return result == null ? Map.of() : Collections.unmodifiableMap(result);
     }
 
     public Money balance(String accountId, int valueDayCutoff) {
