@@ -40,12 +40,14 @@ instalment split — and both route through one static half-up helper on `Money`
 operation asserts matching currency, so adding AED to BHD is unrepresentable rather than
 merely discouraged.
 
-**3.3 The ledger is four append-only lists and nothing else.** Postings, authorization
-transitions, accruals and errors. Each list is private with an unmodifiable view out and
-append as the only mutator. State that looks mutable — an authorization's current state, a
-day's closing balance — is derived by querying those lists, never stored back. There is no
-second representation of state anywhere in the program, which is why there are no snapshot
-or result objects.
+**3.3 The ledger is four append-only lists plus two write-through caches.** Postings,
+authorization transitions, accruals and errors. Each list is private with an unmodifiable
+view out and append as the only mutator. Two caches sit alongside the lists: a per-account
+`TreeMap<Integer, Money>` snapshot for restated balance queries, updated on every `append()`
+and invalidated from the posted `valueDay` onwards when a backdated entry arrives; and a
+`LinkedHashMap<String, AuthorizationTransition>` keyed by `authRef` for O(1) current-state
+lookups, updated on every `record(AuthorizationTransition)`. Neither cache is a second source
+of truth — both are derived from the lists and can be dropped without changing any answer.
 
 **3.4 Only the rulings that are actually exercised are configurable.** Six policy fields,
 not twelve. Every other ambiguity was decided once, is a named constant in the engine, and is
@@ -94,7 +96,7 @@ accountLedgerCore/
 ### Money
 
 ```java
-public record Money(long minor, CurrencyCode currency) implements Comparable<Money> {
+public record Money(long minor, CurrencyCode currency) {
     static Money of(String decimal, CurrencyCode c);   // "1,200.00" -> 120000 fils
     static Money ofMinor(long minor, CurrencyCode c);
     static Money zero(CurrencyCode c);
@@ -151,7 +153,7 @@ with the event it reverses becomes a logged error rather than a silently applied
 
 ```java
 record Posting(long seq, String eventId, String accountId, Money amount,
-               int valueDay, int bookingDay, Type type) {
+               int valueDay, int bookingDay, Type type, String reversesEventId) {
     enum Type { OPENING_BALANCE, CREDIT, DEBIT, SETTLEMENT, REVERSAL,
                 OVERDRAFT_FEE, INTEREST_CAPITALISATION, FEE_REFUND }
 }
@@ -164,8 +166,8 @@ record AuthorizationTransition(String authRef, String accountId, Money amount,
 record Accrual(String accountId, int day, Money amount) {}
 
 record LedgerError(int day, String eventId, Code code, String detail) {
-    enum Code { ORPHAN_SETTLEMENT, AUTHORIZATION_DECLINED, OVER_SETTLEMENT,
-                INSTALMENT_RESIDUAL_DISCARDED, FEE_CURRENCY_UNDEFINED,
+    enum Code { ORPHAN_SETTLEMENT, AUTHORIZATION_DECLINED, AUTHORIZATION_NOT_OPEN,
+                OVER_SETTLEMENT, INSTALMENT_RESIDUAL_DISCARDED, FEE_CURRENCY_UNDEFINED,
                 REVERSAL_TARGET_NOT_FOUND, DUPLICATE_REVERSAL }
 }
 ```
@@ -216,13 +218,17 @@ public final class Ledger {
 }
 ```
 
-`balance` sums postings where `valueDay <= cutoff`, and for the three-argument overload also
-`bookingDay <= knownByBookingDay`. That second form is what makes "what did Day 2 look like
-at the end of Day 5" answerable, which acceptance criterion one asks for directly.
+`balance(id, day)` routes through the per-account `TreeMap` snapshot: finds the nearest
+cached day with `floorEntry`, scans only postings after that day, and stores the result.
+Backdated postings clear the snapshot from their `valueDay` onwards via `tailMap(...).clear()`.
 
-Every scan is linear over all postings. At ten events that is free; the call site carries a
-comment naming the ceiling and pointing at snapshot invalidation as the production fix, so
-the trade-off is visible in the code and not only in a document.
+`balance(id, day, bookingDay)` — the point-in-time overload — does a full linear scan.
+The snapshot covers all booking days so cannot be reused here. This is the remaining hot
+path at scale; see `ARCHITECTURE.md` for the next fix.
+
+`stateOf` and `holdOf` read from `latestTransitionCache` in O(1).
+`activeHolds(id, asAtDay)` uses the time-bounded overload `latestTransitions(asAtDay)` which
+still does a full scan of the transition log.
 
 ## 7. Engine
 
@@ -340,11 +346,14 @@ rather than a starting number.
 `ReportPrinter` reads straight off the `Ledger` — there is no intermediate snapshot type,
 because the ledger already holds every figure and a second copy could only drift from it.
 
-Per day, per account: closing ledger balance, available balance, active holds, fee assessed,
-accrual stored, interest capitalised on the last day, every authorization with its current
-state, then that day's errors. Available balance and holds are printed even though the brief
-does not ask for them, because they are the only place a hold is visible and without them a
-reader cannot see why an authorization was declined.
+Per day, per account: closing ledger balance (at close and restated if different), available
+balance, active holds, fee assessed, accrual stored, interest capitalised on the last day,
+every authorization with its current state, then that day's errors. Available balance and
+holds are printed even though the brief does not ask for them, because they are the only
+place a hold is visible and without them a reader cannot see why an authorization was declined.
+
+A paginated overload `print(ledger, firstDay, lastDay, out, pageSize, page)` slices the day
+window into pages and prints a summary only on the last page.
 
 `Main` runs the same stream twice — under `LedgerPolicy.defaults()` and again with
 `reopenClosedDays = true` — and prints both, so the two readings of the overdraft rule can be
@@ -373,6 +382,12 @@ holds, and the append-only property.
 **`LedgerEngineTest`** — authorization approve and decline, settlement against a valid
 authorization and an orphan one, reversal including the duplicate guard, instalment splitting,
 fee assessment and its once-per-day cap, and the accrual being computed after the fee.
+
+**`SampleStreamsTest`** — five independent event streams, each testing a distinct real-world
+scenario: full merchant lifecycle with reversal; overdraft cascade across three days with
+recovery; authorization edge cases (orphan, over-settlement, duplicate settle); two accounts
+in different currencies where BHD has no fee defined; and multiple backdated entries exercising
+the point-in-time bitemporal query directly.
 
 **`AcceptanceCriteriaTest`** — one test per criterion. For the four refused, the test asserts
 the value the design holds to be correct and carries an inline comment naming why the stated
