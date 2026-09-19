@@ -14,6 +14,9 @@
 | Is a balance of exactly zero negative? | No, strictly below zero. ACC-002 sits at zero for four days and is never charged. |
 | Is interest simple or compounding? | Simple. Accruals stay outside the balance until they capitalise, so they never earn interest themselves. |
 | Interest basis | Closing balance, not average or minimum daily balance. |
+| Should `valueDay` allow future dates? | Not decided. Current code accepts it. A future valueDay would accrue interest on a day that has not closed. Likely a data error in most cases but valid for forward-dated instruments. Awaiting product ruling. |
+| Should partial settlement keep the auth open for the remaining amount? | Not decided. First settlement closes the auth entirely and releases the full hold. Split-shipment and hotel-checkout scenarios need the hold to decrement and stay open. Awaiting product ruling. |
+| Is the fee model correct for joint accounts? | Not decided. Engine ties one fee to one `accountId`. A joint account may have two cardholders — fee eligibility and amount depend on the account agreement. No ruling exists. |
 
 ## Authorization and Settlement
 
@@ -26,14 +29,6 @@
 | Is a declined authorization recorded? | Yes — a `DECLINED` transition plus an `AUTHORIZATION_DECLINED` error, so it appears in the day's output with the balance that caused it. |
 | Does a hold reduce the ledger balance or only available balance? | Only available balance. The rule defines available as ledger balance minus holds, so a hold inside the ledger would be counted twice. |
 
-
-## Open questions — no ruling yet
-
-| Ambiguity | Current behaviour | What needs deciding |
-| --- | --- | --- |
-| Should `valueDay` allow future dates? | Not blocked. An event with `valueDay` ahead of `bookingDay` is accepted and will accrue interest on a day that has not yet closed. | A future valueDay is economically unusual and likely a data error. Recommendation: reject if `valueDay > bookingDay`, but this needs a product ruling — pre-value-dated instruments (forward contracts, scheduled debits) are a legitimate use case in some products. |
-| Should partial settlement keep the auth open for the remaining amount? | No. First settlement closes the auth entirely and releases the full hold. Any remaining balance the merchant intends to collect later has no hold backing it. | Split-shipment and hotel-checkout scenarios require the auth to stay open and the hold to decrement on each partial. The current model quietly under-holds after the first partial. Needs a product decision on whether to support partial settlement before this is used in production. |
-| Is the fee model correct for joint accounts? | Not considered. The engine ties one fee to one `accountId` and one closing balance. | A joint account may have two cardholders. Fee eligibility, fee amount, and who is notified depends on the account agreement. The current model would charge one fee on the shared balance — correct for some products, wrong for others. No ruling exists. |
 
 ## Reversals
 
