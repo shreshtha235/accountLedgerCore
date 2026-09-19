@@ -106,7 +106,7 @@ DAY 5
 ================================================================================
   ACC-001  AED
     closing ledger balance (at close)     AED -180.00
-    closing ledger balance (restated now) AED  440.00   <-- changed by a later backdated entry
+    closing ledger balance (as known Day 6)AED 440.00   <-- backdated entry arrived on day 6
     available balance                     AED -180.00
     active holds                          AED 0.00
     overdraft fee assessed                AED 25.00
@@ -122,7 +122,7 @@ DAY 5
 | Field | Example value | Meaning |
 | --- | --- | --- |
 | closing ledger balance (at close) | AED 250.00 | Sum of all postings value-dated up to this day, as known when the day closed |
-| closing ledger balance (restated now) | AED 440.00 | Same sum recalculated today — appears only when a later backdated entry changed it |
+| closing ledger balance (as known Day X) | AED 440.00 | Balance as it stood when booking day X closed — appears for each booking day that changed this day's balance via a backdated entry |
 | available balance | AED 50.00 | Ledger balance minus active holds — what can actually be spent |
 | active holds | AED 200.00 | Money reserved for a pending transaction; not posted to ledger yet |
 | overdraft fee assessed | AED 25.00 | Charged when closing balance went below zero |
