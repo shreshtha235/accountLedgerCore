@@ -18,6 +18,33 @@ The build runs all tests. A successful build means all tests pass. The container
 
 ### Without Docker — needs Java 21+ and Maven
 
+**Install Java 21 and Maven (one-time setup)**
+
+Mac:
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+After Homebrew finishes it prints two lines starting with `eval` — run those, then:
+```bash
+brew install maven
+brew install --cask temurin@21
+```
+
+Windows — download and install both:
+- Java 21: https://adoptium.net/en-GB/temurin/releases/?version=21
+- Maven: https://maven.apache.org/download.cgi (then add its `bin` folder to PATH — guide: https://maven.apache.org/install.html)
+
+Linux:
+```bash
+sudo apt install maven openjdk-21-jdk
+```
+
+Verify both are installed:
+```bash
+mvn -version
+java -version
+```
+
 ```bash
 mvn test
 ```
