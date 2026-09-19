@@ -43,7 +43,7 @@ state so there is no reason they cannot run in parallel.
 Pre-compute and store the closing balance at day-close time. When the engine closes a day it
 already knows `balance(id, day, day)` — store it in a `Map<String, Map<Integer, Money>>` keyed
 by `(accountId, valueDay)`. ReportPrinter reads the stored value instead of rescanning the
-posting list. Only `Ledger.java` and `LedgerEngine.java` change.
+posting list.
 
 The 2D snapshot cache (`(valueDay, bookingDay)` key) does not help here — ReportPrinter calls
 `balance(id, day, day)` once per account per day, every pair is unique, hit rate is zero.
