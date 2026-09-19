@@ -92,6 +92,7 @@ DAY 2
 ================================================================================
   ACC-001  AED
     closing ledger balance (at close)     AED 250.00
+    closing ledger balance (as known Day 5)AED -370.00   <-- backdated entry arrived on day 5
     available balance                     AED  50.00
     active holds                          AED 200.00
     overdraft fee assessed                none

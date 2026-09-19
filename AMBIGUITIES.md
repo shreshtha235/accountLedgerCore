@@ -46,3 +46,4 @@
 | Do all three instalments share one value date? | Yes, all three are value-dated Day 5 as the event states. |
 | Is a zero accrual stored, or skipped? | Stored. One row per account per day, so the capitalised credit reconciles row by row. |
 | Should available balance and holds be printed, given the brief does not ask for them? | Yes. They are the only place a hold is visible, and without them a reader cannot see why an authorization was declined. |
+| Is the intermediate state of a backdated day visible to the user? | Yes. When a backdated posting arrives, the output shows the affected day's balance as known on each booking day it changed — so the window between a debit arriving and its reversal is visible. |
