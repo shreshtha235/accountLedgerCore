@@ -15,7 +15,21 @@ public final class ReportPrinter {
     }
 
     public static void print(Ledger ledger, int firstDay, int lastDay, PrintStream out) {
-        for (int day = firstDay; day <= lastDay; day++) {
+        print(ledger, firstDay, lastDay, out, lastDay - firstDay + 1, 0);
+    }
+
+    public static void print(Ledger ledger, int firstDay, int lastDay, PrintStream out,
+                             int pageSize, int page) {
+        int windowStart = firstDay + (page * pageSize);
+        int windowEnd   = Math.min(windowStart + pageSize - 1, lastDay);
+        int totalPages  = (int) Math.ceil((double) (lastDay - firstDay + 1) / pageSize);
+
+        if (windowStart > lastDay) {
+            out.printf("Page %d does not exist. Total pages: %d%n", page + 1, totalPages);
+            return;
+        }
+
+        for (int day = windowStart; day <= windowEnd; day++) {
             out.println(RULE);
             out.println("DAY " + day);
             out.println(RULE);
@@ -25,7 +39,14 @@ public final class ReportPrinter {
             printErrors(ledger.errorsOn(day), out);
             out.println();
         }
-        printSummary(ledger, firstDay, lastDay, out);
+
+        if (totalPages > 1) {
+            out.printf("  Page %d of %d%n", page + 1, totalPages);
+        }
+
+        if (windowEnd == lastDay) {
+            printSummary(ledger, firstDay, lastDay, out);
+        }
     }
 
     private static void printAccount(Ledger ledger, Account account, int day, int lastDay,

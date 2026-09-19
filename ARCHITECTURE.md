@@ -5,233 +5,142 @@ method names refer to real code.
 
 ## 1. Append-only at scale
 
-### What breaks first
+The restated balance — `balance(id, day)` — uses a per-account `TreeMap` snapshot. When called,
+it finds the nearest cached day, scans only postings after that, and stores the result. When a
+backdated posting arrives, entries from its value day onwards are cleared.
 
-**`balance()` query speed.** Every call does a full linear scan over all postings — no index, no
-snapshot. `ReportPrinter` calls it multiple times per account per day (balance, available, fee
-check). At 100× accounts and 100× days over a 100× bigger posting list, query cost becomes
-O(accounts × days × postings). That is the first thing to collapse. There is already a comment in
-`Ledger.java` admitting this:
+### What breaks first at 100×
 
-```
-// Linear scan per query. Correct and free at this volume; a backdated entry invalidates any
-// cached balance, so nothing is cached.
-```
+**Point-in-time balance queries.** `balance(id, day, bookingDay)` has no snapshot and does a
+full scan every time. The report printer calls this for every "at close" column, for every
+account, for every day. At 100× accounts and 100× days over a 100× bigger posting list, this
+collapses first.
 
-**Authorization decision timeout.** `activeHolds` calls `latestTransitions`, which allocates a
-fresh map and folds the entire transition log on every call. A card authorization must answer in
-a few hundred milliseconds. At scale this path times out — which surfaces as declines to
-customers rather than as an alert, making it harder to attribute.
+**Authorization decision speed.** `activeHolds` and `stateOf` use `latestTransitionCache` —
+a `LinkedHashMap` updated on every `record()` call, so the current state of each auth ref is
+O(1) to look up. The `latestTransitions(asAtDay)` overload used for point-in-time auth queries
+does a full scan. At scale the full-scan path times out — a timeout shows up as a decline to
+the customer, not as an alert.
 
-**Day close becoming quadratic.** `closeDay` calls `balance` twice per account per day. The work
-grows with the square of the window length. Invisible at six days, significant at a year.
+**Replay from Day 1 on every run.** `replay()` reprocesses the full event list from the
+beginning every time. No checkpoint exists. At 100× events this means replaying months of
+history just to process today's work.
 
-**Replay from scratch.** Every `replay()` reprocesses the full event list from Day 1. At 100×
-events, replaying months of history just to process today's batch is not viable. There is no
-checkpoint.
-
-**Single-threaded processing.** The engine processes one account at a time. At 100× accounts,
-accounts are independent — there is no reason ACC-001 and ACC-002 cannot run simultaneously.
-
-**Report printer scans postings three times per account.** Separate passes for credits, debits,
-and fees. One pass with accumulators would fix it, but the real fix is moving postings to a
-database with indexed queries.
-
-**No pagination on output.** `ReportPrinter` prints everything. 100× accounts × 100× days is
-either unreadable or crashes the consumer.
+**Single-threaded processing.** The engine handles one account at a time. Accounts share no
+state so there is no reason they cannot run in parallel.
 
 ### Where state accumulates unbounded
 
-All four lists — `postings`, `transitions`, `accruals`, `errors` — grow forever in memory. No
-archival, no partitioning, no eviction. The whole ledger history lives in RAM for every replay.
+- **Posting log** — grows forever in RAM with no eviction or archival.
+- **Transition log** — settled and declined authorizations never cleaned up. The cache covers
+  the hot path, but the point-in-time overload (`latestTransitions(asAtDay)`) folds the whole
+  log on every call, and the log grows without bound.
+- **Accrual log** — one row per account per day including explicit zeros. Grows fastest.
+- **Snapshot map** — every unique day queried adds an entry and nothing evicts old ones.
 
-- **Accrual log** grows fastest: one row per account per day, including explicit zeros.
-- **Posting log** is the source of truth and must be kept, but needs to move to durable storage.
-- **Transition log** is never aged out, so settled and declined authorizations accumulate alongside
-  live ones — and `latestTransitions` folds the entire log on every call, so dead rows slow every
-  live decision.
-- **`Ledger` itself** holds all four lists with no ceiling on memory.
+### Cheapest structural change that defers the problem
 
-### Cheapest structural fix
+Apply the same snapshot pattern to the point-in-time query — cache by `(valueDay, bookingDay)`
+pair instead of just `valueDay`. Same invalidation logic. Only `Ledger.java` changes. This cuts
+the scan cost for the "at close" column the same way the existing snapshot cut the restated
+balance cost.
 
-A `Map<Integer, Money>` per account — one closing balance snapshot per day. A balance query reads
-the nearest snapshot before the cutoff and applies only postings after it. A backdated entry
-invalidates snapshots from its value day forward — the invalidation set is exactly computable
-and cheap to apply. This is a cache, not a record, so it does not touch the append-only model.
-It can be retrofitted behind the existing `Ledger.balance` signature with no change to callers.
+### What that still does not fix
 
-This one change fixes the hot query path without restructuring anything.
-
-### What it does not fix — the real 100× fixes
-
-- **Postings in a database.** Move all four lists out of RAM into durable indexed storage.
-  Queries become indexed lookups, not full scans.
-- **Daily checkpoint.** Store ledger state at end-of-day. Resume replay from the checkpoint, not
-  from Day 1.
-- **Parallel replay per account.** Accounts are independent. Fan out across threads or nodes.
-- **Back-value window limit.** Bounding how far back an entry may reach also bounds
-  snapshot-invalidation cost. One control protects both correctness and performance.
+- **Unbounded lists in RAM** — move postings, transitions, and accruals to a database. Queries
+  become indexed lookups, restarts survive, storage scales independently of the JVM heap.
+- **Replay from Day 1** — store a daily checkpoint and resume from there instead of replaying
+  the full history every run.
+- **Single-threaded** — fan out replay per account across threads or nodes.
+- **Concurrent writes at scale** — at 100× events arrive from multiple sources at the same time
+  — mobile app, ATM, payment network, back-office. Without ordering, two events on the same
+  account both pass the balance check. A message queue like Kafka gives ordering per account so
+  the engine always processes events in sequence. The append-only model makes this a natural fit
+  — Kafka is itself append-only. Without Kafka the alternative is per-account locks or optimistic
+  locking in the database.
 
 ## 2. Value-dated entries in production
 
-Every `Posting` here carries a `bookingDay` and a `valueDay`, which means two truths coexist: what
-the books said at the time, and what they say now. Almost every operational failure downstream is
-someone answering with the wrong one. `ReportPrinter` prints both for exactly that reason, and
-this ledger's own Day 5 is the illustration — it closed at −180.00 and now reads 440.00.
+Every posting carries a `bookingDay` (when the system learned about it) and a `valueDay` (when it
+counts economically). When these differ, two versions of the truth coexist. Day 5 in this ledger
+shows this — it closed at AED −180.00 and now reads AED 440.00 after a backdated entry arrived.
 
 ### Operational surface
 
-Statements already issued become wrong when a backdated entry lands, so there must be a standing
-policy on reissue versus a correction on the next cycle. Front-line staff need the as-at view,
-which `Ledger.balance(account, valueDay, knownByBookingDay)` provides, or they will quote a
-customer a balance that never appeared on any statement.
+When a backdated entry lands, balances change for days that have already passed.
 
-Day-end reconciliation against correspondent accounts and against the general ledger is disturbed,
-because a figure in an already-signed-off period moves. Interest and fee recalculation stops being
-an exception and becomes a scheduled process. Disputes get harder: a customer charged a fee whose
-cause was later reversed — precisely this ledger's Day 5 fee against E9 — will complain, and the
-system, the statement and the agent all have to give the same answer.
-
-Payment cut-off times and value-date conventions have to match the ledger's understanding exactly,
-including what happens when a value day falls on a non-working day. This implementation has no
-business-day calendar at all, so it accrues interest and assesses fees on every day of the window.
-The UAE working week moved to Monday–Friday in 2022, and practice still varies between
-institutions, so that is something to pin down rather than assume.
+- **Customer statements** already sent for those days are now wrong. The bank needs a policy on
+  whether to reissue or correct on the next cycle.
+- **Front-line staff** quoting a balance must use the as-at view — `balance(id, day, bookingDay)` —
+  or they will give the customer a number that never appeared on any statement.
+- **Fees and interest** for the affected days may need recalculating. This code deliberately does
+  not reopen past days for fees. That is a valid decision but must be written policy, not just a
+  code flag.
+- **Reconciliation** against the general ledger is disturbed because a signed-off figure moves.
 
 ### Regulatory surface
 
-The CBUAE is the licensing and supervisory authority, and prudential returns are as-at a date. A
-backdated entry restates a figure that has already been filed, which turns a data correction into a
-reporting event. Under IFRS the same entry can move revenue or expense recognition across a closed
-period.
+- **CBUAE filings** are as-at a date. A backdated entry that changes an already-filed number is a
+  reporting event, not a silent data fix.
+- **VAT** — UAE charges 5% on fees. A fee has a tax date. Backdating a fee into a previous month
+  touches a filed VAT period and requires a formal VAT amendment.
+- **AML** monitoring runs on booking day — what the system saw and when. A backdated entry cannot
+  retroactively rerun AML on a closed period.
+- **IFRS** — a backdated entry can move revenue or expense recognition across a closed accounting
+  period.
 
-Fees in the UAE carry VAT at five percent, and a fee's tax point is a date, so backdating a fee can
-reach into a filed VAT period. Consumer protection rules require each charge to be disclosed and
-justifiable, which in practice means being able to reproduce the exact basis on which a fee was
-assessed — the as-at balance, not the current one. AML monitoring keys off what was seen and when,
-so it must run on booking day; keying it to value day would let a backdated entry rewrite a pattern
-monitoring had already cleared. Retention obligations require every version of the truth to be
-reproducible, commonly five years, though the precise period should be confirmed with compliance
-rather than assumed.
+### One control before go-live
 
-And if the entity or a window within it is Sharia-compliant, daily interest accrual is not an
-applicable construct at all; the whole of `LedgerEngine`'s accrual and capitalisation path would
-need replacing with a profit-sharing mechanism.
+A hard limit on how far back an entry can be value-dated — for example, three days. Anything
+older requires named manager approval with a written reason before it is accepted.
 
-### The one control before go-live
-
-**A hard back-value window enforced at the point of entry, aligned to the accounting period close,
-with named human approval and a full audit record for anything beyond it.**
-
-This implementation has no such limit — `AMBIGUITIES.md` entry 26 records that as a deliberate gap.
-E7 reaches back three days and E9 four, and nothing would stop an entry reaching back three years.
-
-It is the right single control because it converts an unbounded liability into a bounded one.
-Ordinary corrections land inside an open period where recomputation is safe and cheap; anything
-that would restate a reported period is stopped and escalated rather than applied silently. It also
-bounds the snapshot-invalidation cost from section 1, so one control protects both correctness and
-performance.
-
-If a second were allowed, it would be a daily reconciliation that rebuilds every balance from the
-posting log and compares it against the snapshot — a cache that is never verified is a liability.
+This code has no such limit. An entry can reach back any number of days and silently restate
+figures in already-filed periods. One cutoff rule protects VAT, CBUAE filings, AML, and customer
+statements all at once — because the damage only happens when an entry reaches far enough back to
+cross a closed period. It also bounds the snapshot-invalidation cost from section 1, so one
+control protects both correctness and performance.
 
 ## 3. Authorization lifecycle
 
-`AuthorizationTransition.State` has four values: `APPROVED`, `DECLINED`, `SETTLED`, `RELEASED`.
-One observation about the code first, because it is a genuine finding: **`RELEASED` is declared and
-never written anywhere.** `LedgerEngine.applySettle` records `SETTLED` and releases the whole hold
-in that transition, so there is no path that produces a `RELEASED` row. It is dead today, and it is
-the state every unimplemented ending below would need.
+Every ending other than a normal settlement falls into one of two groups: endings the code handles
+today, and endings it cannot express.
 
-A unifying rule worth stating: of every ending in this section, only settlement, over-settlement
-and chargeback create postings. Every other ending moves available balance alone. That single fact
-removes most of the confusion in this area.
+### Endings the code handles
 
-### Endings this implementation handles
+| Ending | Real-world scenario | System behavior |
+|---|---|---|
+| Declined at request | Not enough balance when the auth is requested — Auth-B in the event stream | No hold created, DECLINED transition recorded, AUTHORIZATION_DECLINED error logged with the balance that caused it |
+| Settled for less | Restaurant pre-auths an estimate including tip, actual bill is lower | Posts the settled amount, releases the full hold; the unused portion returns to available balance without ever posting |
+| Settled for more | Hotel adds incidentals on checkout beyond the authorised amount | Posts the full settlement amount, releases the hold, logs OVER_SETTLEMENT for review; never declines — an overdraft here is legitimate and must be visible |
+| Second settlement on a closed auth | Merchant retries a settlement already processed | Rejected with AUTHORIZATION_NOT_OPEN, nothing posted |
+| Settlement with no matching auth | Settlement message arrives for a reference that was never authorised | Rejected with ORPHAN_SETTLEMENT, nothing posted, no transition created |
 
-**Declined at request.** Not enough headroom when asked. Auth-B in this stream: available was
-−155.00 before the 90.00 hold was even applied. Behaviour: no hold, no posting, a `DECLINED`
-transition, and an `AUTHORIZATION_DECLINED` error carrying the balance that caused it — because
-declines generate complaints and must be explainable months later.
+### Endings the code cannot handle
 
-**Settled for less than the hold.** A restaurant authorising an estimate including a tip and
-settling for less; a fuel pre-auth settling for the litres actually dispensed. Auth-A here: held
-200.00, settled 185.00. Behaviour: post the settled amount, release the hold in full. The unused
-15.00 returns to available balance without ever posting — it was a reservation, never money.
-
-**Settled for more than the hold.** A tip added after authorization, or hotel incidentals.
-Behaviour: post in full, release the hold, raise `OVER_SETTLEMENT` for review. Never decline a
-settlement for insufficient funds — that produces an unauthorised overdraft, which is a legitimate
-outcome that must be visible rather than suppressed.
-
-**A second settlement against a closed authorization.** Behaviour: rejected with
-`AUTHORIZATION_NOT_OPEN`, no posting. The first settlement closes the authorization.
-
-**No authorization at all.** Auth-Z here. Behaviour: `ORPHAN_SETTLEMENT`, no posting, no
-transition — there is nothing to transition, which is the distinction acceptance criterion 4 gets
-wrong.
-
-### Endings this implementation does not handle
-
-Each would write a `RELEASED` row, which is why that state exists.
-
-**Expiry.** The merchant never completes — a cancelled hotel stay, an abandoned online order.
-Mandate: auto-release after a window configured per merchant category, not one global number, since
-fuel and hospitality behave nothing like retail. Record the release as its own transition. Auth-B
-in this stream is never settled, and with no expiry a hold would sit against the account
-indefinitely.
-
-**Void or reversal by the merchant or acquirer.** The transaction is cancelled before settling, or
-a terminal times out. Mandate: release in full immediately, and make it idempotent, because these
-messages are retransmitted as a matter of routine. This needs a sixth `LedgerEvent` type; the
-current five cannot express it.
-
-**Multiple partial settlements against one authorization.** A split shipment from one order.
-Mandate: decrement the hold on each and keep the authorization open until the hold is exhausted, it
-expires, or it is explicitly closed. The current model cannot represent a partially consumed hold —
-`Ledger.holdOf` returns the full `APPROVED` amount or nothing.
-
-**Chargeback after settlement.** Mandate: the authorization is already closed and stays closed; the
-dispute is a new posting, never a reopening. Worth stating explicitly because this is the case where
-people reach for mutation, which the append-only rule forbids.
-
-**Account-level termination.** The account is blocked, frozen, closed, or hits a sanctions match
-while a hold is live; or the holder dies. Mandate: holds must not silently vanish — freeze them and
-require manual disposition, because an automatic release on a blocked account is a route for funds
-to leave.
-
-**Fraud cancellation after approval.** Mandate: release the hold, but record the reason distinctly
-from an expiry. The two mean entirely different things to fraud, to disputes and to the customer,
-and a single `RELEASED` state with no reason code cannot tell them apart — which is an argument for
-the `reason` field `AuthorizationTransition` already carries.
-
-**Duplicate authorization.** The same request arrives twice on a retry. Mandate: idempotency on the
-authorization reference, so the second creates no second hold. This is the highest-value guard in
-the area and its absence is the most common production defect. The current code has a real bug
-here: a second `Authorize` for an existing reference appends another transition that silently
-supersedes the first.
-
-**Stale hold sweep.** A release message is lost and a hold sits indefinitely, understating available
-balance. Mandate: a scheduled sweep reporting holds past their expected window, reconciled against
-the scheme's own records. Expiry logic nothing ever runs is indistinguishable from no expiry logic.
+| Ending | Real-world scenario | What should happen |
+|---|---|---|
+| Merchant cancels before settling | Hotel stay cancelled, merchant voids the auth before any settlement | Release the hold immediately; make it idempotent since void messages are routinely retransmitted. Needs a new event type — the current five cannot express a merchant-initiated cancel |
+| Auth expires | Online order abandoned, merchant never settles — Auth-B in the event stream is an example | Auto-release after a window set per merchant category; fuel and hospitality have very different windows. Without this, the hold sits forever and understates available balance indefinitely |
+| Partial settlement, auth stays open | Split shipment — first box delivered and settled, second still coming | Decrement the hold on each partial settlement and keep the auth open until the hold is exhausted or it expires. The current model closes the auth on the first settlement |
+| Account blocked while a hold is live | Fraud freeze or sanctions hit while an approved hold exists | Freeze the hold and require manual disposition; do not auto-release, as releasing on a blocked account is a route for funds to leave |
 
 ## 4. What was cut, and the risk each defers
 
-| Cut | Production risk deferred |
-| --- | --- |
-| Double-entry contra postings | Only the customer side exists. No contra account for fee income or interest expense, so the ledger does not balance in the accounting sense and could not be handed to finance. The largest single omission. |
-| Persistence | No durability, no crash recovery, and startup replay time grows with total history. |
-| Concurrency control | `LedgerEngine` is single-threaded. In production two authorizations on one account could both pass `available()` and over-commit the balance. Needs per-account serialisation or a version check on the balance read. |
-| Inbound idempotency keys | A retransmitted event posts twice. Payment rails retransmit routinely, so this is the most likely first incident. |
-| Authorization reference idempotency | A repeated `Authorize` for the same reference silently supersedes the first transition instead of being rejected. A live bug, not just an omission. |
-| Period close and a back-value limit | Any entry can restate a reported period. The control named in section 2. |
-| Post-capitalisation interest correction | Demonstrated by `BackValuedInterestTest`, which fails by AED 0.48 rather than hiding the gap. Needs a back-valued adjustment and a cutoff date, both policy decisions. |
-| Business-day calendar | Interest accrues and fees are assessed on days the bank is shut. |
-| Currency conversion | A fee cannot be charged to an account in another currency. `feeFor(BHD)` returns empty and logs `FEE_CURRENCY_UNDEFINED` rather than guessing a rate — a loud gap by choice, and one this event stream never reaches. |
-| Hold expiry, and the `EXPIRED` / `PARTIALLY_SETTLED` states | A lost release pins a hold forever and understates available balance indefinitely. |
-| An acquirer void event | The five `LedgerEvent` types cannot express a merchant cancelling before settlement. |
-| Balance snapshots and memoised holds | Every query is a linear scan and `latestTransitions` reallocates per call. The first thing to break at scale, on the one path with a latency budget. |
-| Access control and maker-checker | A single operator could post an unreviewed correction. |
-| Metrics and observability | No counters on fee assessments, accrual totals or hold ages, so drift would go unnoticed until a reconciliation failed. |
-| Operational workflow on errors | Failures are recorded in `ErrorLog` but nothing acts on them. In production a rejected settlement is the start of a process involving a person, not the end of one. |
-| Rate sophistication | One flat simple rate. No tiering, no scheduled rate changes, no mid-period change — which is itself a value-dated problem and would reuse the same machinery. |
+### Would block go-live
+
+| Cut | Production risk |
+|---|---|
+| No persistence | Everything is in RAM. A restart loses all data. No database, no crash recovery. |
+| No double-entry | Only the customer side is posted. No contra entry for fee income or interest expense. Finance cannot use this ledger. |
+| No concurrency control | Two authorization requests on the same account at the same time can both pass the balance check and over-commit. Works only because the engine is single-threaded and in-memory. |
+| No idempotency on inbound events | A retransmitted event posts twice. Payment networks retransmit routinely. Most likely first production incident. |
+
+### Would cause customer complaints
+
+| Cut | Production risk |
+|---|---|
+| No hold expiry | A hold that is never settled sits forever and understates available balance indefinitely. Auth-B in our own stream demonstrates this. |
+| No back-value limit | Any entry can restate any past period silently — VAT, CBUAE filings, AML, customer statements all affected. Covered in section 2. |
+| No business-day calendar | Interest accrues and fees fire on weekends and public holidays. |
+| Post-capitalisation interest correction | A reversal arriving after interest has been capitalised leaves an uncorrected error that grows over time. The failing test (`mvn test -Pfailing`) demonstrates this with an AED 0.48 gap. |
+

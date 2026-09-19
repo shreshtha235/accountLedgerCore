@@ -22,6 +22,8 @@ public final class Ledger {
     private final List<LedgerError> errors = new ArrayList<>();
     // per-account balance snapshots: valueDay → cumulative balance up to that day (all bookings)
     private final Map<String, TreeMap<Integer, Money>> snapshots = new HashMap<>();
+    // latest state per authRef — rebuilt on every record(), never scanned from scratch
+    private final Map<String, AuthorizationTransition> latestTransitionCache = new LinkedHashMap<>();
     private long nextSeq;
 
     public Ledger(List<Account> accounts) {
@@ -97,6 +99,7 @@ public final class Ledger {
         Objects.requireNonNull(transition, "transition");
         requireCurrency(transition.accountId(), transition.amount());
         transitions.add(transition);
+        latestTransitionCache.put(transition.authRef(), transition);
     }
 
     public void record(Accrual accrual) {
@@ -212,7 +215,7 @@ public final class Ledger {
     }
 
     private Map<String, AuthorizationTransition> latestTransitions() {
-        return latestTransitions(Integer.MAX_VALUE);
+        return latestTransitionCache;
     }
 
     private Map<String, AuthorizationTransition> latestTransitions(int asAtDay) {
