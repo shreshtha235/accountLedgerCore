@@ -14,9 +14,9 @@
 | Is a balance of exactly zero negative? | No, strictly below zero. ACC-002 sits at zero for four days and is never charged. |
 | Is interest simple or compounding? | Simple. Accruals stay outside the balance until they capitalise, so they never earn interest themselves. |
 | Interest basis | Closing balance, not average or minimum daily balance. |
-| Should `valueDay` allow future dates? | Not decided. Current code accepts it. Awaiting product ruling. |
-| Should partial settlement keep the auth open for the remaining amount? | Not decided. First settlement closes the auth entirely. Awaiting product ruling. |
-| Is the fee model correct for joint accounts? | Not decided. Engine ties one fee to one `accountId`. No ruling exists. |
+| Should `valueDay` allow future dates? | Accepted. No validation. A future valueDay posts and accrues interest on a day not yet closed. |
+| Should partial settlement keep the auth open for the remaining amount? | No. First settlement closes the auth entirely and releases the full hold. |
+| Is the fee model correct for joint accounts? | One fee per `accountId` on the shared closing balance. No per-holder logic. |
 
 ## Authorization and Settlement
 
