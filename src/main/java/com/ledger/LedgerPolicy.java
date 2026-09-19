@@ -8,7 +8,7 @@ public record LedgerPolicy(long rateNumerator,
                            long rateDenominator,
                            Map<CurrencyCode, Money> overdraftFee,
                            ResidualPolicy instalmentResidual,
-                           boolean reopenClosedDays,
+                           boolean reopenClosedDaysForFeesCalculation,
                            boolean refundFeeOnReversal) {
 
     public enum ResidualPolicy {
@@ -51,13 +51,13 @@ public record LedgerPolicy(long rateNumerator,
         return Optional.ofNullable(overdraftFee.get(currency));
     }
 
-    public LedgerPolicy withReopenClosedDays(boolean reopen) {
+    public LedgerPolicy withReopenClosedDaysForFeesCalculation(boolean reopen) {
         return new LedgerPolicy(rateNumerator, rateDenominator, overdraftFee, instalmentResidual,
                 reopen, refundFeeOnReversal);
     }
 
     public LedgerPolicy withRefundFeeOnReversal(boolean refund) {
         return new LedgerPolicy(rateNumerator, rateDenominator, overdraftFee, instalmentResidual,
-                reopenClosedDays, refund);
+                reopenClosedDaysForFeesCalculation, refund);
     }
 }

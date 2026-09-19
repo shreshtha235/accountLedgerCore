@@ -234,7 +234,7 @@ public final class LedgerEngine {
 
     private void closeDay(Ledger ledger, int today, int firstDay) {
         for (Account account : accounts) {
-            int from = policy.reopenClosedDays() ? firstDay : today;
+            int from = policy.reopenClosedDaysForFeesCalculation() ? firstDay : today;
             for (int day = from; day <= today; day++) {
                 assessFee(ledger, account, day, today);
             }

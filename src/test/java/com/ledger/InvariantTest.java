@@ -18,7 +18,7 @@ class InvariantTest {
 
     private static List<LedgerPolicy> bothReadings() {
         return List.of(LedgerPolicy.defaults(),
-                LedgerPolicy.defaults().withReopenClosedDays(true));
+                LedgerPolicy.defaults().withReopenClosedDaysForFeesCalculation(true));
     }
 
     @Test

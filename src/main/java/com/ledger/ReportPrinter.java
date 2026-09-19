@@ -83,15 +83,32 @@ public final class ReportPrinter {
         out.println(RULE);
         for (Account account : ledger.accounts()) {
             String id = account.id();
+            CurrencyCode ccy = account.currency();
             List<String> daily = new ArrayList<>();
             for (int day = firstDay; day <= lastDay; day++) {
                 daily.add(ledger.accrual(id, day).format());
             }
             Money total = ledger.accrualTotal(id);
-            Money capitalised = ledger.capitalisationFor(id).orElse(Money.zero(account.currency()));
+            Money capitalised = ledger.capitalisationFor(id).orElse(Money.zero(ccy));
 
-            out.printf("  %s  %s%n", id, account.currency());
+            Money totalCredits = ledger.postings().stream()
+                    .filter(p -> p.accountId().equals(id) && p.amount().isPositive())
+                    .map(Posting::amount)
+                    .reduce(Money.zero(ccy), Money::plus);
+            Money totalDebits = ledger.postings().stream()
+                    .filter(p -> p.accountId().equals(id) && p.amount().isNegative())
+                    .map(p -> p.amount().negated())
+                    .reduce(Money.zero(ccy), Money::plus);
+            Money totalFees = ledger.postings().stream()
+                    .filter(p -> p.accountId().equals(id) && p.type() == Posting.Type.OVERDRAFT_FEE)
+                    .map(p -> p.amount().negated())
+                    .reduce(Money.zero(ccy), Money::plus);
+
+            out.printf("  %s  %s%n", id, ccy);
             out.printf(FIELD, "final ledger balance", ledger.balance(id, lastDay).format());
+            out.printf(FIELD, "total credits", totalCredits.format());
+            out.printf(FIELD, "total debits", totalDebits.format());
+            out.printf(FIELD, "total fees charged", totalFees.isZero() ? "none" : totalFees.format());
             out.printf(FIELD, "daily accruals", String.join("  ", daily));
             out.printf(FIELD, "sum of daily accruals", total.format());
             out.printf(FIELD, "capitalised credit", capitalised.format());

@@ -62,7 +62,7 @@ class AcceptanceCriteriaTest {
         assertEquals(aed("-25.00"), ledger.feeOn(EventStream.ACC_001, 5).orElseThrow());
 
         Ledger reopened = new LedgerEngine(EventStream.accounts(),
-                LedgerPolicy.defaults().withReopenClosedDays(true))
+                LedgerPolicy.defaults().withReopenClosedDaysForFeesCalculation(true))
                 .replay(EventStream.events(), EventStream.FIRST_DAY, EventStream.LAST_DAY);
         long reopenedFees = reopened.postings().stream()
                 .filter(posting -> posting.type() == Posting.Type.OVERDRAFT_FEE)
