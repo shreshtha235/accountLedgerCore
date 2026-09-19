@@ -131,3 +131,42 @@ DAY 5
 | errors | AUTHORIZATION_DECLINED | Business rejections — nothing crashes, reason is logged with the event |
 
 ACC-001 closes at **AED 440.83**. ACC-002 closes at **BHD 10.007**.
+
+## Using your own event stream
+
+The given stream lives in `src/main/java/com/ledger/EventStream.java`.
+
+**Option 1 — edit the stream and see the output**
+
+Edit `EventStream.java` directly and rerun:
+
+```bash
+mvn compile exec:java
+```
+
+**Option 2 — write a test with your own stream**
+
+Add a new `@Test` in `src/test/java/com/ledger/SampleStreamsTest.java` following the same pattern:
+
+```java
+@Test
+void myStream() {
+    List<LedgerEvent> events = List.of(
+        new LedgerEvent.Credit("E1", 1, "ACC-1", Money.of("1000.00", AED), 1, 1),
+        new LedgerEvent.Debit("E2",  2, "ACC-1", Money.of("400.00",  AED), 2)
+        // add more events here
+    );
+    Ledger ledger = new LedgerEngine(
+        List.of(new Account("ACC-1", AED, Money.zero(AED))),
+        LedgerPolicy.defaults()).replay(events, 1, 3);
+
+    // assert or just print
+    ReportPrinter.print(ledger, 1, 3, System.out);
+}
+```
+
+Then run:
+
+```bash
+mvn test -Dtest=SampleStreamsTest
+```
