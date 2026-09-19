@@ -5,64 +5,72 @@ method names refer to real code.
 
 ## 1. Append-only at scale
 
-### What breaks first at 100×
+### What breaks first
 
-Not storage. The read path, and specifically the authorization decision.
+**`balance()` query speed.** Every call does a full linear scan over all postings — no index, no
+snapshot. `ReportPrinter` calls it multiple times per account per day (balance, available, fee
+check). At 100× accounts and 100× days over a 100× bigger posting list, query cost becomes
+O(accounts × days × postings). That is the first thing to collapse. There is already a comment in
+`Ledger.java` admitting this:
 
-`Ledger.balance` is a linear scan over every posting ever written. `Ledger.activeHolds` is
-worse: it calls `latestTransitions`, which allocates a fresh `LinkedHashMap` and folds the entire
-transition log on **every** call, and four separate query methods call it. So
-`LedgerEngine.applyAuthorize` costs O(postings + transitions) and allocates a map per decision.
+```
+// Linear scan per query. Correct and free at this volume; a backdated entry invalidates any
+// cached balance, so nothing is cached.
+```
 
-That is the method with a latency budget. A card authorization has to answer in a few hundred
-milliseconds; day close and fee assessment are batch work and can be slow without anyone
-noticing. So the first symptom at scale is not a wrong number, it is authorization timeouts —
-which surface as declines to customers rather than as an alert, and are correspondingly harder to
-attribute.
+**Authorization decision timeout.** `activeHolds` calls `latestTransitions`, which allocates a
+fresh map and folds the entire transition log on every call. A card authorization must answer in
+a few hundred milliseconds. At scale this path times out — which surfaces as declines to
+customers rather than as an alert, making it harder to attribute.
 
-The second thing to break is day close, which is quietly quadratic. `LedgerEngine.closeDay`
-calls `balance` twice per account per day, and with `reopenClosedDays` enabled it re-assesses
-every day from the start of the window, so the work grows with the square of the window length.
-At a six-day window that is invisible; at a year it is not.
+**Day close becoming quadratic.** `closeDay` calls `balance` twice per account per day. The work
+grows with the square of the window length. Invisible at six days, significant at a year.
 
-### Where unbounded state accumulates
+**Replay from scratch.** Every `replay()` reprocesses the full event list from Day 1. At 100×
+events, replaying months of history just to process today's batch is not viable. There is no
+checkpoint.
 
-Four places, in order of how fast they grow:
+**Single-threaded processing.** The engine processes one account at a time. At 100× accounts,
+accounts are independent — there is no reason ACC-001 and ACC-002 cannot run simultaneously.
 
-- **The accrual log.** One `Accrual` row per account per day, forever, including explicit zeros.
-  Accounts × days. This is the fastest-growing structure in the system and the first that would
-  need partitioning.
-- **The posting log.** By design, correctly, and it is the source of truth.
-- **The transition log.** Never aged out, so settled and declined authorizations accumulate
-  alongside live ones — and because `latestTransitions` folds the whole log, dead rows slow down
-  every live decision.
-- **`Ledger` itself,** which holds all four lists in memory with no eviction. Memory has no
-  ceiling.
+**Report printer scans postings three times per account.** Separate passes for credits, debits,
+and fees. One pass with accumulators would fix it, but the real fix is moving postings to a
+database with indexed queries.
 
-The real problem is not the storage cost. It is that read cost grows with total history and never
-comes down, because nothing is ever removed and nothing is cached.
+**No pagination on output.** `ReportPrinter` prints everything. 100× accounts × 100× days is
+either unreadable or crashes the consumer.
 
-### The cheapest structural change
+### Where state accumulates unbounded
 
-A per-account, per-day closing-balance snapshot, plus memoising `latestTransitions`.
+All four lists — `postings`, `transitions`, `accruals`, `errors` — grow forever in memory. No
+archival, no partitioning, no eviction. The whole ledger history lives in RAM for every replay.
 
-A balance query then reads the newest snapshot at or before the cutoff and applies only the
-postings after it. Read cost becomes bounded by the snapshot interval instead of by all history.
+- **Accrual log** grows fastest: one row per account per day, including explicit zeros.
+- **Posting log** is the source of truth and must be kept, but needs to move to durable storage.
+- **Transition log** is never aged out, so settled and declined authorizations accumulate alongside
+  live ones — and `latestTransitions` folds the entire log on every call, so dead rows slow every
+  live decision.
+- **`Ledger` itself** holds all four lists with no ceiling on memory.
 
-The load-bearing constraint is that a snapshot must be a **cache, never a record**. A backdated
-entry invalidates every snapshot for that account whose value day is at or after the arriving
-entry's value day. Because the value day is known at arrival, the invalidation set is computable
-exactly and cheaply. Keeping snapshots outside the four append-only lists preserves the
-append-only guarantee, since a discardable cache is not part of the ledger.
+### Cheapest structural fix
 
-It is the cheapest option because it changes no data model, touches no event, needs no migration,
-and can be retrofitted behind the existing `Ledger.balance` signature — callers never learn it
-happened.
+A `Map<Integer, Money>` per account — one closing balance snapshot per day. A balance query reads
+the nearest snapshot before the cutoff and applies only postings after it. A backdated entry
+invalidates snapshots from its value day forward — the invalidation set is exactly computable
+and cheap to apply. This is a cache, not a record, so it does not touch the append-only model.
+It can be retrofitted behind the existing `Ledger.balance` signature with no change to callers.
 
-It defers rather than solves. Log growth is untouched, so partitioning by account and date range
-is still coming. And it does nothing about write amplification: a bulk back-value correction file,
-which real banks receive, invalidates a wide range at once. Bounding how far back an entry may
-reach is the complementary fix, and it belongs to the next section.
+This one change fixes the hot query path without restructuring anything.
+
+### What it does not fix — the real 100× fixes
+
+- **Postings in a database.** Move all four lists out of RAM into durable indexed storage.
+  Queries become indexed lookups, not full scans.
+- **Daily checkpoint.** Store ledger state at end-of-day. Resume replay from the checkpoint, not
+  from Day 1.
+- **Parallel replay per account.** Accounts are independent. Fan out across threads or nodes.
+- **Back-value window limit.** Bounding how far back an entry may reach also bounds
+  snapshot-invalidation cost. One control protects both correctness and performance.
 
 ## 2. Value-dated entries in production
 

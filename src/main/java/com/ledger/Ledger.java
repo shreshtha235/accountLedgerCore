@@ -3,11 +3,13 @@ package com.ledger;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 
 public final class Ledger {
 
@@ -18,6 +20,8 @@ public final class Ledger {
     private final List<AuthorizationTransition> transitions = new ArrayList<>();
     private final List<Accrual> accruals = new ArrayList<>();
     private final List<LedgerError> errors = new ArrayList<>();
+    // per-account balance snapshots: valueDay → cumulative balance up to that day (all bookings)
+    private final Map<String, TreeMap<Integer, Money>> snapshots = new HashMap<>();
     private long nextSeq;
 
     public Ledger(List<Account> accounts) {
@@ -80,6 +84,12 @@ public final class Ledger {
         requireCurrency(posting.accountId(), posting.amount());
         postings.add(posting);
         nextSeq++;
+        // invalidate snapshots from this posting's value day onwards so stale cached
+        // balances are not returned after a backdated entry arrives
+        TreeMap<Integer, Money> snap = snapshots.get(posting.accountId());
+        if (snap != null) {
+            snap.tailMap(posting.valueDay(), true).clear();
+        }
         return posting;
     }
 
@@ -119,10 +129,12 @@ public final class Ledger {
         return balance(accountId, valueDayCutoff, Integer.MAX_VALUE);
     }
 
-    // Linear scan per query. Correct and free at this volume; a backdated entry invalidates any
-    // cached balance, so nothing is cached. Production fix is a per-day snapshot invalidated from
-    // the value date of each arriving entry.
     public Money balance(String accountId, int valueDayCutoff, int knownByBookingDay) {
+        if (knownByBookingDay == Integer.MAX_VALUE) {
+            return balanceFromSnapshot(accountId, valueDayCutoff);
+        }
+        // point-in-time query with a booking-day cutoff — snapshot covers all bookings so
+        // cannot be used here; fall back to linear scan
         Money total = Money.zero(currencyOf(accountId));
         for (Posting posting : postings) {
             if (posting.accountId().equals(accountId)
@@ -131,6 +143,24 @@ public final class Ledger {
                 total = total.plus(posting.amount());
             }
         }
+        return total;
+    }
+
+    private Money balanceFromSnapshot(String accountId, int valueDayCutoff) {
+        TreeMap<Integer, Money> snap = snapshots.computeIfAbsent(accountId, k -> new TreeMap<>());
+        Map.Entry<Integer, Money> floor = snap.floorEntry(valueDayCutoff);
+        int fromDay = floor == null ? Integer.MIN_VALUE : floor.getKey();
+        Money base  = floor == null ? Money.zero(currencyOf(accountId)) : floor.getValue();
+
+        Money total = base;
+        for (Posting posting : postings) {
+            if (posting.accountId().equals(accountId)
+                    && posting.valueDay() > fromDay
+                    && posting.valueDay() <= valueDayCutoff) {
+                total = total.plus(posting.amount());
+            }
+        }
+        snap.put(valueDayCutoff, total);
         return total;
     }
 
