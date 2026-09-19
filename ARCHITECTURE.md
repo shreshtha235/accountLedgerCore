@@ -40,10 +40,13 @@ state so there is no reason they cannot run in parallel.
 
 ### Cheapest structural change that defers the problem
 
-Apply the same snapshot pattern to the point-in-time query — cache by `(valueDay, bookingDay)`
-pair instead of just `valueDay`. Same invalidation logic. Only `Ledger.java` changes. This cuts
-the scan cost for the "at close" column the same way the existing snapshot cut the restated
-balance cost.
+Pre-compute and store the closing balance at day-close time. When the engine closes a day it
+already knows `balance(id, day, day)` — store it in a `Map<String, Map<Integer, Money>>` keyed
+by `(accountId, valueDay)`. ReportPrinter reads the stored value instead of rescanning the
+posting list. Only `Ledger.java` and `LedgerEngine.java` change.
+
+The 2D snapshot cache (`(valueDay, bookingDay)` key) does not help here — ReportPrinter calls
+`balance(id, day, day)` once per account per day, every pair is unique, hit rate is zero.
 
 ### What that still does not fix
 
